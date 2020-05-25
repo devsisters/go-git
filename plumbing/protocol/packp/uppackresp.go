@@ -24,7 +24,6 @@ type UploadPackResponse struct {
 	r          io.ReadCloser
 	isShallow  bool
 	isMultiACK bool
-	isOk       bool
 }
 
 // NewUploadPackResponse create a new UploadPackResponse instance, the request
@@ -74,9 +73,7 @@ func (r *UploadPackResponse) Decode(reader io.ReadCloser) error {
 // Encode encodes an UploadPackResponse.
 func (r *UploadPackResponse) Encode(w io.Writer) (err error) {
 	if r.isShallow {
-		if err := r.ShallowUpdate.Encode(w); err != nil {
-			return err
-		}
+		return r.ShallowUpdate.Encode(w)
 	}
 
 	if err := r.ServerResponse.Encode(w); err != nil {

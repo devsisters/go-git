@@ -863,7 +863,7 @@ func (s *RemoteSuite) TestGetHaves(c *C) {
 		),
 	}
 
-	l, err := getHaves(localRefs, memory.NewStorage(), sto)
+	l, _, err := getHaves(localRefs, memory.NewStorage(), sto, nil)
 	c.Assert(err, IsNil)
 	c.Assert(l, HasLen, 2)
 }

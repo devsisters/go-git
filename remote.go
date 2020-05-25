@@ -30,6 +30,7 @@ var (
 	ErrDeleteRefNotSupported = errors.New("server does not support delete-refs")
 	ErrForceNeeded           = errors.New("some refs were not updated")
 	ErrExactSHA1NotSupported = errors.New("server does not support exact SHA1 refspec")
+	ErrShallowNotSupported   = errors.New("server does not support shallow")
 )
 
 type NoMatchingRefSpecError struct {
@@ -346,11 +347,26 @@ func (r *Remote) fetch(ctx context.Context, o *FetchOptions) (sto storer.Referen
 	}
 
 	req.Wants, err = getWants(r.s, refs)
+	if err != nil {
+		return nil, err
+	}
+
 	if len(req.Wants) > 0 {
-		req.Haves, err = getHaves(localRefs, remoteRefs, r.s)
+		var shallows []plumbing.Hash
+		shallows, err = r.s.Shallow()
 		if err != nil {
 			return nil, err
 		}
+		if len(shallows) > 0 && !ar.Capabilities.Supports(capability.Shallow) {
+			return nil, ErrShallowNotSupported
+		}
+
+		req.Haves, shallows, err = getHaves(localRefs, remoteRefs, r.s, shallows)
+		if err != nil {
+			return nil, err
+		}
+
+		req.Shallows = shallows
 
 		if err = r.fetchPack(ctx, o, s, req); err != nil {
 			return nil, err
@@ -411,13 +427,13 @@ func (r *Remote) fetchPack(ctx context.Context, o *FetchOptions, s transport.Upl
 
 	defer ioutil.CheckClose(reader, &err)
 
-	if err = r.updateShallow(o, reader); err != nil {
-		return err
-	}
-
 	if err = packfile.UpdateObjectStorage(r.s,
 		buildSidebandIfSupported(req.Capabilities, reader, o.Progress),
 	); err != nil {
+		return err
+	}
+
+	if err = r.updateShallow(o, reader); err != nil {
 		return err
 	}
 
@@ -620,6 +636,7 @@ func getHavesFromRef(
 	remoteRefs map[plumbing.Hash]bool,
 	s storage.Storer,
 	haves map[plumbing.Hash]bool,
+	shallows map[plumbing.Hash]bool,
 ) error {
 	h := ref.Hash()
 	if haves[h] {
@@ -645,24 +662,34 @@ func getHavesFromRef(
 	// commits from the history of each ref.
 	walker := object.NewCommitPreorderIter(commit, haves, nil)
 	toVisit := maxHavesToVisitPerRef
-	return walker.ForEach(func(c *object.Commit) error {
+	var lastCommit *object.Commit
+	err = walker.ForEach(func(c *object.Commit) error {
 		haves[c.Hash] = true
+		lastCommit = c
 		toVisit--
 		// If toVisit starts out at 0 (indicating there is no
 		// max), then it will be negative here and we won't stop
 		// early.
-		if toVisit == 0 || remoteRefs[c.Hash] {
+		if toVisit == 0 || remoteRefs[c.Hash] || shallows[c.Hash] {
 			return storer.ErrStop
 		}
 		return nil
 	})
+	if err == plumbing.ErrObjectNotFound && lastCommit != nil {
+		shallows[lastCommit.Hash] = true
+	} else if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func getHaves(
 	localRefs []*plumbing.Reference,
 	remoteRefStorer storer.ReferenceStorer,
 	s storage.Storer,
-) ([]plumbing.Hash, error) {
+	shallows []plumbing.Hash,
+) ([]plumbing.Hash, []plumbing.Hash, error) {
 	haves := map[plumbing.Hash]bool{}
 
 	// Build a map of all the remote references, to avoid loading too
@@ -670,7 +697,12 @@ func getHaves(
 	// transferred.
 	remoteRefs, err := getRemoteRefsFromStorer(remoteRefStorer)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+
+	shallowMap := make(map[plumbing.Hash]bool, len(shallows))
+	for _, h := range shallows {
+		shallowMap[h] = true
 	}
 
 	for _, ref := range localRefs {
@@ -682,9 +714,9 @@ func getHaves(
 			continue
 		}
 
-		err = getHavesFromRef(ref, remoteRefs, s, haves)
+		err = getHavesFromRef(ref, remoteRefs, s, haves, shallowMap)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
@@ -693,7 +725,12 @@ func getHaves(
 		result = append(result, h)
 	}
 
-	return result, nil
+	var newShallows []plumbing.Hash
+	for h := range shallowMap {
+		newShallows = append(newShallows, h)
+	}
+
+	return result, newShallows, nil
 }
 
 const refspecAllTags = "+refs/tags/*:refs/tags/*"
@@ -793,7 +830,7 @@ func getWants(localStorer storage.Storer, refs memory.ReferenceStorage) ([]plumb
 }
 
 func objectExists(s storer.EncodedObjectStorer, h plumbing.Hash) (bool, error) {
-	_, err := s.EncodedObject(plumbing.AnyObject, h)
+	err := s.HasEncodedObject(h)
 	if err == plumbing.ErrObjectNotFound {
 		return false, nil
 	}
@@ -1143,24 +1180,31 @@ func pushHashes(
 }
 
 func (r *Remote) updateShallow(o *FetchOptions, resp *packp.UploadPackResponse) error {
-	if o.Depth == 0 || len(resp.Shallows) == 0 {
+	if o.Depth == 0 || (len(resp.Shallows) == 0 && len(resp.Unshallows) == 0) {
 		return nil
 	}
 
-	shallows, err := r.s.Shallow()
+	sh, err := r.s.Shallow()
 	if err != nil {
 		return err
 	}
 
-outer:
-	for _, s := range resp.Shallows {
-		for _, oldS := range shallows {
-			if s == oldS {
-				continue outer
-			}
-		}
-		shallows = append(shallows, s)
+	shallows := make(map[plumbing.Hash]struct{}, len(sh))
+	for _, hash := range sh {
+		shallows[hash] = struct{}{}
 	}
 
-	return r.s.SetShallow(shallows)
+	for _, shallow := range resp.Shallows {
+		shallows[shallow] = struct{}{}
+	}
+	for _, unshallow := range resp.Unshallows {
+		delete(shallows, unshallow)
+	}
+
+	sh = sh[:0]
+	for hash := range shallows {
+		sh = append(sh, hash)
+	}
+
+	return r.s.SetShallow(sh)
 }
