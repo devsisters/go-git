@@ -812,7 +812,7 @@ func checkFastForwardUpdate(s storer.EncodedObjectStorer, remoteRefs storer.Refe
 			return err
 		}
 
-		return fmt.Errorf("non-fast-forward update: %s", cmd.Name.String())
+		return ErrNonFastForwardUpdate
 	}
 
 	ff, err := isFastForward(s, cmd.Old, cmd.New)
@@ -821,7 +821,7 @@ func checkFastForwardUpdate(s storer.EncodedObjectStorer, remoteRefs storer.Refe
 	}
 
 	if !ff {
-		return fmt.Errorf("non-fast-forward update: %s", cmd.Name.String())
+		return ErrNonFastForwardUpdate
 	}
 
 	return nil
