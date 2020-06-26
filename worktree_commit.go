@@ -140,7 +140,6 @@ type buildTreeHelper struct {
 	s  storage.Storer
 
 	trees   map[string]*object.Tree
-	entries map[string]*object.TreeEntry
 }
 
 // BuildTree builds the tree objects and push its to the storer, the hash
@@ -148,7 +147,6 @@ type buildTreeHelper struct {
 func (h *buildTreeHelper) BuildTree(idx *index.Index) (plumbing.Hash, error) {
 	const rootNode = ""
 	h.trees = map[string]*object.Tree{rootNode: {}}
-	h.entries = map[string]*object.TreeEntry{}
 
 	for _, e := range idx.Entries {
 		if err := h.commitIndexEntry(e); err != nil {
@@ -174,25 +172,28 @@ func (h *buildTreeHelper) commitIndexEntry(e *index.Entry) error {
 }
 
 func (h *buildTreeHelper) doBuildTree(e *index.Entry, parent, fullpath string) {
-	if _, ok := h.trees[fullpath]; ok {
-		return
-	}
-
-	if _, ok := h.entries[fullpath]; ok {
-		return
-	}
-
 	te := object.TreeEntry{Name: path.Base(fullpath)}
 
 	if fullpath == e.Name {
 		te.Mode = e.Mode
 		te.Hash = e.Hash
-	} else {
+		h.trees[parent].Entries = appendTreeEntry(h.trees[parent].Entries, te)
+	} else if _, ok := h.trees[fullpath]; !ok {
 		te.Mode = filemode.Dir
 		h.trees[fullpath] = &object.Tree{}
+		h.trees[parent].Entries = appendTreeEntry(h.trees[parent].Entries, te)
 	}
+}
 
-	h.trees[parent].Entries = append(h.trees[parent].Entries, te)
+func appendTreeEntry(entries []object.TreeEntry, toAdd object.TreeEntry) []object.TreeEntry {
+	// Remove duplicating entry
+	for i, entry := range entries {
+		if entry.Name == toAdd.Name {
+			entries[i] = entries[len(entries)-1]
+			entries = entries[:len(entries)-1]
+		}
+	}
+	return append(entries, toAdd)
 }
 
 type sortableEntries []object.TreeEntry
