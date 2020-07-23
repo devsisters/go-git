@@ -48,6 +48,10 @@ func objects(
 	ignore []plumbing.Hash,
 	allowMissingObjects bool,
 ) ([]plumbing.Hash, error) {
+	if cs, ok := s.(ConcurrentStorer); ok && cs.Concurrency() > 1 {
+		return objectsConcurrent(cs, objects, ignore, allowMissingObjects)
+	}
+
 	seen := hashListToSet(ignore)
 	result := make(map[plumbing.Hash]bool)
 	visited := make(map[plumbing.Hash]bool)
