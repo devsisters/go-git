@@ -42,6 +42,18 @@ func ObjectsWithStorageForIgnores(
 	return objects(s, objs, ignore, false)
 }
 
+// ObjectsWithDirectIgnores is same as Objects, but `ignore` slice is
+// not expanded to its reachable objects, just matched as-is. This is
+// useful when listing reachable objects while some objects are known
+// to be missing, like shallow repos.
+func ObjectsWithDirectIgnores(
+	s storer.EncodedObjectStorer,
+	objs,
+	ignore []plumbing.Hash,
+) ([]plumbing.Hash, error) {
+	return objects(s, objs, ignore, false)
+}
+
 func objects(
 	s storer.EncodedObjectStorer,
 	objects,
