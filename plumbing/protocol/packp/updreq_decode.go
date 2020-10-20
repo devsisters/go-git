@@ -37,12 +37,6 @@ func errInvalidHash(err error) error {
 	return fmt.Errorf("invalid hash: %s", err.Error())
 }
 
-func errInvalidShallowLineLength(got int) error {
-	return errMalformedRequest(fmt.Sprintf(
-		"invalid shallow line length: expected %d, got %d",
-		shallowLineLength, got))
-}
-
 func errInvalidCommandCapabilitiesLineLength(got int) error {
 	return errMalformedRequest(fmt.Sprintf(
 		"invalid command and capabilities line length: expected at least %d, got %d",
@@ -125,15 +119,19 @@ func (d *updReqDecoder) scanLine() error {
 func (d *updReqDecoder) decodeShallow() error {
 	b := d.s.Bytes()
 
-	if !bytes.HasPrefix(b, shallowNoSp) {
+	if len(b) == 0 {
 		return nil
 	}
 
-	if len(b) != shallowLineLength {
-		return errInvalidShallowLineLength(len(b))
+	if !bytes.HasPrefix(b, shallow) {
+		return errMalformedRequest(fmt.Sprintf("unexpected payload while expecting a shallow: %q", b))
 	}
+	b = bytes.TrimPrefix(b, shallow)
 
-	h, err := parseHash(string(b[len(shallow):]))
+	if len(b) < hashSize {
+		return errInvalidHashSize(len(b))
+	}
+	h, err := parseHash(string(b[:hashSize]))
 	if err != nil {
 		return errInvalidShallowObjId(err)
 	}
