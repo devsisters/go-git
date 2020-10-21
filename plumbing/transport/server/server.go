@@ -10,6 +10,7 @@ import (
 
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/format/packfile"
+	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/plumbing/protocol/packp"
 	"github.com/go-git/go-git/v5/plumbing/protocol/packp/capability"
 	"github.com/go-git/go-git/v5/plumbing/revlist"
@@ -105,6 +106,10 @@ func (s *session) checkSupportedCapabilities(cl *capability.List) error {
 
 type upSession struct {
 	session
+	wants    []plumbing.Hash
+	haves    []plumbing.Hash
+	shallows []plumbing.Hash
+	depth    packp.Depth
 }
 
 func (s *upSession) AdvertisedReferences() (*packp.AdvRefs, error) {
@@ -132,12 +137,8 @@ func (s *upSession) AdvertisedReferences() (*packp.AdvRefs, error) {
 }
 
 func (s *upSession) UploadPack(ctx context.Context, req *packp.UploadPackRequest) (*packp.UploadPackResponse, error) {
-	if req.IsEmpty() {
-		return nil, transport.ErrEmptyUploadPackRequest
-	}
-
-	if err := req.Validate(); err != nil {
-		return nil, err
+	if len(s.wants)+len(req.Wants) == 0 {
+		return nil, fmt.Errorf("want can't be empty")
 	}
 
 	if s.caps == nil {
@@ -153,14 +154,48 @@ func (s *upSession) UploadPack(ctx context.Context, req *packp.UploadPackRequest
 
 	s.caps = req.Capabilities
 
-	if len(req.Shallows) > 0 {
-		return nil, fmt.Errorf("shallow not supported")
+	s.wants = append(s.wants, req.Wants...)
+	s.haves = append(s.haves, req.Haves...)
+	s.shallows = append(s.shallows, req.Shallows...)
+
+	if !req.Depth.IsZero() {
+		s.depth = req.Depth
 	}
 
-	objs, err := s.objectsToUpload(req)
+	common, err := s.commonObjects()
 	if err != nil {
 		return nil, err
 	}
+
+	shallows, shallowParents, err := resolveShallowWithDepth(s.storer, s.wants, s.depth)
+	if err != nil {
+		return nil, err
+	}
+	unshallows := subtractHashes(s.shallows, shallows)
+
+	// if current request is not "done", check if we can exit early without expensive objects listing.
+	if !req.Done {
+		closed, err := isObjectSetClosed(s.storer, s.wants, common)
+		if err != nil {
+			return nil, err
+		}
+		if !closed {
+			// one of "wants" is not reachable to any of "common".
+			resp := packp.NewUploadPackResponse(req)
+			resp.Shallows = shallows
+			resp.Unshallows = unshallows
+			if len(common) > 0 {
+				resp.ACKs = common[:1]
+			}
+			return resp, nil
+		}
+	}
+
+	objs, err := revlist.ObjectsWithDirectIgnores(s.storer, s.wants, shallowParents)
+	if err != nil {
+		return nil, err
+	}
+	objs = subtractHashes(objs, common)
 
 	pr, pw := io.Pipe()
 	e := packfile.NewEncoder(pw, s.storer, false)
@@ -170,18 +205,170 @@ func (s *upSession) UploadPack(ctx context.Context, req *packp.UploadPackRequest
 		pw.CloseWithError(err)
 	}()
 
-	return packp.NewUploadPackResponseWithPackfile(req,
-		ioutil.NewContextReadCloser(ctx, pr),
-	), nil
+	resp := packp.NewUploadPackResponseWithPackfile(req, ioutil.NewContextReadCloser(ctx, pr))
+	resp.Shallows = shallows
+	resp.Unshallows = unshallows
+
+	if len(common) > 0 {
+		resp.ACKs = common[:1]
+	}
+
+	return resp, nil
 }
 
-func (s *upSession) objectsToUpload(req *packp.UploadPackRequest) ([]plumbing.Hash, error) {
-	haves, err := revlist.Objects(s.storer, req.Haves, nil)
+// subtractHashes takes two lists, a and b, and returns a new list (a - b).
+func subtractHashes(a, b []plumbing.Hash) []plumbing.Hash {
+	m := make(map[plumbing.Hash]struct{}, len(a))
+	for _, hash := range a {
+		m[hash] = struct{}{}
+	}
+	for _, hash := range b {
+		delete(m, hash)
+	}
+	l := make([]plumbing.Hash, len(m))
+	i := 0
+	for hash := range m {
+		l[i] = hash
+		i++
+	}
+	return l
+}
+
+// isObjectSetClosed tests whether every "wants" have path to at least one "common".
+// if object set is closed, server can start sending pack of objects within this set.
+func isObjectSetClosed(st storer.EncodedObjectStorer, wants, common []plumbing.Hash) (bool, error) {
+	commonMap := make(map[plumbing.Hash]struct{}, len(common))
+	for _, hash := range common {
+		commonMap[hash] = struct{}{}
+	}
+
+	for _, want := range wants {
+		commit, err := object.GetCommit(st, want)
+		if err == plumbing.ErrObjectNotFound {
+			return false, nil
+		} else if err != nil {
+			return false, err
+		}
+
+		closed := false
+		err = object.NewCommitPreorderIter(commit, nil, nil).ForEach(func(c *object.Commit) error {
+			if _, ok := commonMap[c.Hash]; ok {
+				closed = true
+				return io.EOF
+			}
+			return nil
+		})
+		if err != nil && err != io.EOF {
+			return false, err
+		}
+
+		if !closed {
+			// want is not reachable
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
+// commonObjects finds objects that this server and the client have in common.
+func (s *upSession) commonObjects() ([]plumbing.Hash, error) {
+	var ignoreHaves []plumbing.Hash
+	// Ignore "have"s that does not exist on this server.
+	for _, have := range s.haves {
+		err := s.storer.HasEncodedObject(have)
+		if err == plumbing.ErrObjectNotFound {
+			ignoreHaves = append(ignoreHaves, have)
+		} else if err != nil {
+			return nil, err
+		}
+	}
+	// Treat parents of the "shallow" commits missing on the client.
+	for _, hash := range s.shallows {
+		shallow, err := object.GetCommit(s.storer, hash)
+		if err == plumbing.ErrObjectNotFound {
+			continue
+		} else if err != nil {
+			return nil, err
+		}
+		ignoreHaves = append(ignoreHaves, shallow.ParentHashes...)
+	}
+
+	common, err := revlist.ObjectsWithDirectIgnores(s.storer, s.haves, ignoreHaves)
 	if err != nil {
 		return nil, err
 	}
 
-	return revlist.Objects(s.storer, req.Wants, haves)
+	return common, nil
+}
+
+func resolveShallowWithDepth(st storer.EncodedObjectStorer, wants []plumbing.Hash, depth packp.Depth) ([]plumbing.Hash, []plumbing.Hash, error) {
+	if depth == nil {
+		return nil, nil, nil
+	}
+
+	switch depth := depth.(type) {
+	case packp.DepthCommits:
+		if depth <= 0 {
+			return nil, nil, nil
+		}
+
+		current := make(map[plumbing.Hash]struct{}, len(wants))
+		next := make(map[plumbing.Hash]struct{})
+		childs := make(map[plumbing.Hash][]*object.Commit)
+		ends := make(map[plumbing.Hash]struct{})
+		seen := make(map[plumbing.Hash]bool)
+
+		for _, hash := range wants {
+			current[hash] = struct{}{}
+		}
+
+		for d := 0; d < int(depth); d++ {
+			for hash := range current {
+				if seen[hash] {
+					continue
+				}
+				commit, err := object.GetCommit(st, hash)
+				if err == plumbing.ErrObjectNotFound {
+					ends[hash] = struct{}{}
+					continue
+				} else if err != nil {
+					return nil, nil, err
+				}
+				for _, parent := range commit.ParentHashes {
+					childs[parent] = append(childs[parent], commit)
+					next[parent] = struct{}{}
+				}
+				seen[hash] = true
+			}
+
+			current, next = next, current
+			for k := range next {
+				delete(next, k)
+			}
+
+			if len(current) == 0 {
+				break
+			}
+		}
+
+		for hash := range current {
+			ends[hash] = struct{}{}
+		}
+
+		var shallow []plumbing.Hash
+		var ignore []plumbing.Hash
+		for hash := range ends {
+			for _, commit := range childs[hash] {
+				shallow = append(shallow, commit.Hash)
+			}
+			ignore = append(ignore, hash)
+		}
+
+		return shallow, ignore, nil
+	default:
+		return nil, nil, fmt.Errorf("unsupported depth type")
+	}
 }
 
 func (*upSession) setSupportedCapabilities(c *capability.List) error {
@@ -190,6 +377,10 @@ func (*upSession) setSupportedCapabilities(c *capability.List) error {
 	}
 
 	if err := c.Set(capability.OFSDelta); err != nil {
+		return err
+	}
+
+	if err := c.Set(capability.Shallow); err != nil {
 		return err
 	}
 

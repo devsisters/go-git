@@ -313,21 +313,23 @@ func (p *Parser) get(o *objectInfo, buf *bytes.Buffer) (err error) {
 	if p.storage != nil && !o.Type.IsDelta() {
 		var e plumbing.EncodedObject
 		e, err = p.storage.EncodedObject(plumbing.AnyObject, o.SHA1)
-		if err != nil {
+		if err != plumbing.ErrObjectNotFound {
+			if err != nil {
+				return err
+			}
+			o.Type = e.Type()
+
+			var r io.ReadCloser
+			r, err = e.Reader()
+			if err != nil {
+				return err
+			}
+
+			defer ioutil.CheckClose(r, &err)
+
+			_, err = buf.ReadFrom(io.LimitReader(r, e.Size()))
 			return err
 		}
-		o.Type = e.Type()
-
-		var r io.ReadCloser
-		r, err = e.Reader()
-		if err != nil {
-			return err
-		}
-
-		defer ioutil.CheckClose(r, &err)
-
-		_, err = buf.ReadFrom(io.LimitReader(r, e.Size()))
-		return err
 	}
 
 	if o.ExternalRef {
